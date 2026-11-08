@@ -1,0 +1,3 @@
+target/
+anvil.lock
+/examples/text/*.png

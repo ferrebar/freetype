@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # The ferron-lang/ferron release tag (`vX.Y.Z-alpha.N`) or commit this
+  # package is tested with; move it together with the `ferron` requirement
+  # in anvil.toml.
+  FERRON_REF: v0.9.0-alpha.1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the compiler
+        uses: actions/checkout@v4
+        with:
+          repository: ferron-lang/ferron
+          ref: ${{ env.FERRON_REF }}
+          # ferron-lang/ferron is private; README.md names the secret.
+          token: ${{ secrets.FERRON_REPO_TOKEN }}
+          path: .ferron
+      - name: Install FreeType and clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfreetype-dev clang
+          dpkg-query -W libfreetype-dev
+      - name: Build anvil
+        working-directory: .ferron
+        run: |
+          scripts/build-anvil --release
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+      - run: anvil check
+      # The tests close every library and face; the runtime's handle
+      # metrics confirm nothing they used is left alive.
+      - name: anvil test
+        run: |
+          FERRON_NATIVE_HANDLE_METRICS_PATH="$RUNNER_TEMP/handles.txt" anvil test
+          grep -x live_handles=0 "$RUNNER_TEMP/handles.txt"
+      - run: anvil fmt --check
+      - name: Example
+        working-directory: examples/text
+        run: anvil run -- "Ferrebar CI" "$RUNNER_TEMP/text.png"
+      # Last: on a mismatch it regenerates src/sys/ to show the difference.
+      - name: anvil ffi gen --check
+        run: anvil ffi gen --check || { anvil ffi gen; git diff; exit 1; }

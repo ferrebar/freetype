@@ -1,0 +1,13 @@
+// `freetype`: FreeType 2 through the system `libfreetype`, enough for a
+// game to rasterize text.
+//
+// - `freetype.library`: `Library`, the initialized library (a resource),
+//   which opens faces from a file or from bytes.
+// - `freetype.face`: `Face` (a resource): pixel size, char to glyph index,
+//   glyphs rendered to 8-bit grayscale `Glyph`s, `FaceMetrics`, kerning,
+//   family and style names.
+// - `freetype.error`: `FreeTypeError` and `FreeTypeErrorKind`.
+//
+// `pkg.sys` holds the generated `extern "C"` modules (`anvil ffi gen`); they
+// stay inside this package. Each module holds its own tests; `pkg.tests`
+// holds the ones over the bundled test font.

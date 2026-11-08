@@ -1,0 +1,143 @@
+// Renders a line of text with the bundled Liberation Sans into a PNG:
+// `anvil run -- [text] [output.png]` from `examples/text`.
+//
+// Each glyph's 8-bit coverage is laid out on a pen line (advance plus
+// kerning), drawn black on white into a grayscale canvas, and written as an
+// RGB PNG, since `std.image.png` encodes RGB and RGBA only.
+
+use std.bytes.Bytes
+use std.env.Env
+use std.fs.Path
+use std.image.Rgb
+use std.image.png.encode_rgb
+use std.io.IoError
+use freetype.error.FreeTypeError
+use freetype.face.{Face, Glyph}
+use freetype.library.Library
+
+const FONT: String = "../../tests/fonts/LiberationSans-Regular.ttf"
+const PIXELS: Int = 48
+const MARGIN: Int = 8
+
+type AppError =
+  | Font(error: FreeTypeError)
+  | Io(error: IoError)
+
+impl FromError[FreeTypeError] for AppError {
+  fn from_error(error: FreeTypeError) -> AppError {
+    return Font(error)
+  }
+}
+
+impl FromError[IoError] for AppError {
+  fn from_error(error: IoError) -> AppError {
+    return Io(error)
+  }
+}
+
+impl Display for AppError {
+  fn to_string(self) -> String {
+    match self {
+      Font(error) => return "freetype: {error}"
+      Io(error) => return "io: {error}"
+    }
+  }
+}
+
+// A glyph and the pen position it is drawn at.
+struct Placed {
+  glyph: Glyph,
+  x: Int,
+}
+
+fn main(env: Env) -> Result[Unit, AppError] {
+  let args = env.args.values()
+  let text = if args.len() > 0 {
+    args[0]
+  } else {
+    "Hello, Ferrebar! AVATAR Wavy fjord, 0123456789"
+  }
+  let output = if args.len() > 1 {
+    args[1]
+  } else {
+    "text.png"
+  }
+  with library = Library.new()? {
+    with face = library.open_face(env.fs, Path.from(FONT))? {
+      face.set_pixel_size(PIXELS)?
+      let placed = layout(face, text)?
+      let metrics = face.metrics()
+      var width = MARGIN
+      for item in placed {
+        width = width.max(item.x + item.glyph.left + item.glyph.width)
+      }
+      width += MARGIN
+      let height = metrics.line_height + 2 * MARGIN
+      let baseline = MARGIN + metrics.ascender
+      // Coverage, 0 to 255, one byte per pixel.
+      var canvas = List.filled(width * height, 0u8)
+      for item in placed {
+        draw(
+          mut canvas,
+          width,
+          item.glyph,
+          MARGIN + item.x + item.glyph.left,
+          baseline - item.glyph.top
+        )
+      }
+      var rgb: List[u8] = []
+      for coverage in canvas {
+        let shade = 255u8 - coverage
+        rgb.push(shade)
+        rgb.push(shade)
+        rgb.push(shade)
+      }
+      let png = encode_rgb(Rgb { width: width, height: height, pixels: Bytes.from(rgb) })
+      env.fs.write_bytes(Path.from(output), png)?
+      env.console.print(
+        "{face.family_name()} {face.style_name()} at {PIXELS} px: \"{text}\", {placed.len()} glyphs, {width}x{height} -> {output}"
+      )
+    }
+  }
+  return Ok(Unit)
+}
+
+// Each code point's glyph at its pen position: the previous glyph's
+// advance plus the pair's kerning.
+fn layout(face: Face, text: String) -> Result[List[Placed], FreeTypeError] {
+  var placed: List[Placed] = []
+  var pen = 0
+  var previous = 0
+  for code_point in text.code_points() {
+    let index = face.char_index(code_point)
+    if previous != 0 && index != 0 {
+      pen += face.kerning(previous, index)?
+    }
+    let glyph = face.glyph(index)?
+    let advance = glyph.advance
+    placed.push(Placed { glyph: glyph, x: pen })
+    pen += advance
+    previous = index
+  }
+  return Ok(placed)
+}
+
+// Draws `glyph`'s coverage with its top-left pixel at (`x`, `y`), keeping
+// the larger coverage where glyphs overlap.
+fn draw(canvas: mut List[u8], width: Int, glyph: Glyph, x: Int, y: Int) -> Unit {
+  let height = canvas.len() / width
+  let pixels = glyph.pixels.to_list()
+  for row in 0..glyph.rows {
+    for column in 0..glyph.width {
+      let cx = x + column
+      let cy = y + row
+      if cx >= 0 && cx < width && cy >= 0 && cy < height {
+        let coverage = pixels[row * glyph.pitch + column]
+        let at = cy * width + cx
+        if coverage > canvas[at] {
+          canvas[at] = coverage
+        }
+      }
+    }
+  }
+}

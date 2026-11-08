@@ -1,0 +1,9 @@
+[package]
+name = "freetype"
+version = "0.1.0"
+ferron = ">=0.9.0-alpha.1"
+license = "MIT"
+ffi = true
+
+[native]
+link = ["freetype"]

@@ -1,0 +1,183 @@
+// End-to-end tests over the bundled Liberation Sans Regular
+// (`tests/fonts/`, SIL OFL 1.1): faces from bytes and files, metrics,
+// rendering, kerning, errors, and the close order of faces and libraries.
+
+use std.bytes.Bytes
+use std.test.TestContext
+use pkg.error.{CannotOpen, FreeTypeError, InvalidArgument, InvalidGlyph}
+use pkg.face.Face
+use pkg.library.Library
+
+#[embed("../tests/fonts/LiberationSans-Regular.ttf")]
+const FONT: Bytes
+
+fn library() -> Library {
+  return Library.new().expect_ok("FT_Init_FreeType")
+}
+
+fn sans(library: Library) -> Face {
+  let face = library.face_from_bytes(FONT).expect_ok("Liberation Sans")
+  face.set_pixel_size(32).expect_ok("32 px")
+  return face
+}
+
+fn kind(result: take Result[Face, FreeTypeError]) -> String {
+  return match result {
+    Ok(face) => {
+      face.close()
+      "a face"
+    }
+    Err(error) => "{error.kind}"
+  }
+}
+
+fn code(text: String) -> u32 {
+  return text.code_points()[0]
+}
+
+#[test("a face from bytes has the font's names and metrics")]
+fn face_from_bytes() -> Unit {
+  with library = library() {
+    with face = sans(library) {
+      expect.equal(face.family_name(), "Liberation Sans")
+      expect.equal(face.style_name(), "Regular")
+      let metrics = face.metrics()
+      expect.equal(metrics.ascender, 29)
+      expect.equal(metrics.descender, -7)
+      expect.equal(metrics.line_height, 37)
+    }
+  }
+}
+
+#[test("a face opens from a file and matches the one from bytes")]
+fn face_from_file(context: TestContext) -> Unit {
+  let path = context.temp_dir() / "LiberationSans-Regular.ttf"
+  context.fs.write_bytes(path, FONT).expect_ok("write the font")
+  with library = library() {
+    with face = library.open_face(context.fs, path).expect_ok("open the file") {
+      face.set_pixel_size(32).expect_ok("32 px")
+      expect.equal(face.family_name(), "Liberation Sans")
+      let from_bytes = sans(library)
+      expect.equal(face.metrics(), from_bytes.metrics())
+      expect.equal(face.glyph(face.char_index(code("g"))), from_bytes.glyph(from_bytes.char_index(code("g"))))
+    }
+  }
+}
+
+#[test("a glyph renders to 8-bit coverage with its placement")]
+fn glyph_renders() -> Unit {
+  with library = library() {
+    with face = sans(library) {
+      let index = face.char_index(code("A"))
+      expect.equal(index > 0, true)
+      let a = face.glyph(index).expect_ok("render A")
+      expect.equal(a.index, index)
+      expect.equal(a.width > 15 && a.width < 25, true)
+      // The cap height of Liberation Sans is 0.69 em, 22 px at 32 px; "A"
+      // stands on the baseline.
+      expect.equal(a.rows, 22)
+      expect.equal(a.top, a.rows)
+      expect.equal(a.pitch >= a.width, true)
+      expect.equal(a.pixels.len(), a.rows * a.pitch)
+      expect.equal(a.advance, 21)
+      // Full coverage inside the strokes, none in the corners.
+      expect.equal(a.pixels.to_list().contains(255u8), true)
+      expect.equal(a.pixels.get(0), Some(0u8))
+      // A descender hangs below the baseline.
+      let g = face.glyph(face.char_index(code("g"))).expect_ok("render g")
+      expect.equal(g.top < g.rows, true)
+      // A space has an advance and no ink.
+      let space = face.glyph(face.char_index(code(" "))).expect_ok("render a space")
+      expect.equal(space.rows, 0)
+      expect.equal(space.pixels.is_empty(), true)
+      expect.equal(space.advance > 0, true)
+      // A size change re-renders larger.
+      face.set_pixel_size(64).expect_ok("64 px")
+      expect.equal(face.glyph(index).expect_ok("render A at 64").rows > 2 * 22 - 2, true)
+    }
+  }
+}
+
+#[test("characters without a glyph map to index 0")]
+fn missing_character() -> Unit {
+  with library = library() {
+    with face = sans(library) {
+      // U+4E2D, a CJK ideograph Liberation Sans does not cover.
+      expect.equal(face.char_index(20013u32), 0)
+      expect.equal(face.glyph(0).expect_ok("the missing-glyph box").rows > 0, true)
+    }
+  }
+}
+
+#[test("kerning pulls A and V together and leaves other pairs alone")]
+fn kerning() -> Unit {
+  with library = library() {
+    with face = sans(library) {
+      expect.equal(face.has_kerning(), true)
+      let a = face.char_index(code("A"))
+      let v = face.char_index(code("V"))
+      let o = face.char_index(code("o"))
+      expect.equal(face.kerning(a, v).expect_ok("A V") < 0, true)
+      expect.equal(face.kerning(o, o), Ok(0))
+    }
+  }
+}
+
+#[test("a missing file, garbage bytes, and bad arguments are errors")]
+fn errors(context: TestContext) -> Unit {
+  with library = library() {
+    expect.equal(kind(library.open_face(context.fs, context.temp_dir() / "missing.ttf")), "CannotOpen")
+    // Which of the two depends on whether a driver takes the data for its
+    // format (FreeType 2.15 says `Invalid_File_Format` for both).
+    let formats = ["UnknownFormat", "InvalidFormat"]
+    expect.equal(
+      formats.contains(kind(library.face_from_bytes(Bytes.from_latin1("not a font ".repeat(100))))),
+      true
+    )
+    expect.equal(formats.contains(kind(library.face_from_bytes(Bytes.from_latin1("\0".repeat(1000))))), true)
+    expect.equal(kind(library.face_from_bytes(Bytes.empty())) != "a face", true)
+    match library.open_face(context.fs, context.temp_dir() / "missing.ttf") {
+      Ok(face) => {
+        face.close()
+        expect.equal("opened", "an error")
+      }
+      Err(error) => {
+        expect.equal(error.kind, CannotOpen)
+        expect.equal(error.code, 1)
+        expect.equal("{error}".starts_with("CannotOpen: "), true)
+      }
+    }
+    with face = sans(library) {
+      match face.glyph(1000000) {
+        Ok(_) => expect.equal("rendered", "an error")
+        Err(error) => expect.equal(error.kind, InvalidGlyph)
+      }
+      match face.glyph(-1) {
+        Ok(_) => expect.equal("rendered", "an error")
+        Err(error) => expect.equal(error.kind, InvalidGlyph)
+      }
+      match face.set_pixel_size(0) {
+        Ok(_) => expect.equal("sized", "an error")
+        Err(error) => expect.equal(error.kind, InvalidArgument)
+      }
+    }
+  }
+}
+
+/// A face whose library's scope ended before it is returned.
+fn orphan() -> Face {
+  let library = library()
+  return sans(library)
+}
+
+#[test("a face keeps its library open until it closes")]
+fn face_outlives_library() -> Unit {
+  with face = orphan() {
+    expect.equal(face.glyph(face.char_index(code("A"))).expect_ok("render A").rows, 22)
+  }
+  let library = library()
+  let face = sans(library)
+  library.close()
+  expect.equal(face.glyph(face.char_index(code("V"))).expect_ok("render V").rows > 0, true)
+  face.close()
+}

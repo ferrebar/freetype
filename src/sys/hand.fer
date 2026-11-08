@@ -1,0 +1,17 @@
+// Hand-written beside the generated modules: what `anvil ffi gen` cannot say.
+
+use std.ffi.{CLong, Out, Ptr}
+use pkg.sys.freetype.{FT_Face, FT_Library}
+
+extern "C" {
+  // The face reads `file_base` until `FT_Done_Face`, so it is the address of
+  // a buffer the face owns (`CBuffer.ptr()`), not a `CArray` the generator
+  // would make: a copy freed when the call returns.
+  pub fn FT_New_Memory_Face(
+    library: FT_Library,
+    file_base: Ptr[u8],
+    file_size: CLong,
+    face_index: CLong,
+    aface: Out[FT_Face]
+  ) -> i32
+}

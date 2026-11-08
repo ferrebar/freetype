@@ -1,0 +1,61 @@
+// `freetype.library`: `Library`, an initialized FreeType library over an
+// `FT_Library`, the root every `Face` comes from.
+
+use std.bytes.Bytes
+use std.ffi.Out
+use std.ref.Ref
+use std.fs.{Fs, Path}
+use pkg.error.{FreeTypeError, check}
+use pkg.face.{Face, Shared, finish, open_file, open_memory}
+use pkg.sys.freetype.{FT_Init_FreeType, FT_Library}
+
+/// An initialized FreeType library, a resource from `Library.new()`
+/// (`FT_Init_FreeType`, with every font driver FreeType was built with).
+/// Closing it (the end of its owner's scope, or `close()`) ends it; the
+/// faces made from it keep it alive until they close too, and the last one
+/// runs `FT_Done_FreeType`.
+///
+/// Not `send` (see the README): a library and its faces stay in the actor
+/// that made them, which is FreeType's threading rule (one `FT_Library`
+/// per thread, a face used by one thread at a time) by construction. A
+/// worker actor rasterizing glyphs makes its own `Library`.
+#[foreign_resource(close = release)]
+pub struct Library {
+  shared: Ref[Shared],
+}
+
+fn release(library: Library) -> Unit {
+  library.shared.value.closed = true
+  finish(library.shared)
+}
+
+impl Library {
+  /// A new library (`FT_Init_FreeType`); fails only when out of memory.
+  pub fn new() -> Result[Library, FreeTypeError] {
+    let out = Out[FT_Library].new()
+    check(FT_Init_FreeType(out))?
+    return Ok(Library { shared: Ref.new(Shared { ptr: out.get(), faces: 0, closed: false }) })
+  }
+
+  /// The first face of the font file at `path` (TrueType, OpenType, Type 1,
+  /// ... whatever FreeType reads). `fs` is the capability to read files;
+  /// FreeType opens the file itself and reads it as glyphs load. A missing
+  /// file is a `CannotOpen` error, a file that is no font `UnknownFormat` or
+  /// `InvalidFormat` (when a driver takes it for its format).
+  pub fn open_face(self, fs: Fs, path: Path) -> Result[Face, FreeTypeError] {
+    let _ = fs
+    return open_file(self.shared, "{path}")
+  }
+
+  /// The first face of the font file `data`, such as an `#[embed]`ded
+  /// font. The face keeps its own copy of the bytes. Bytes that are no font
+  /// are an `UnknownFormat` or `InvalidFormat` error.
+  pub fn face_from_bytes(self, data: Bytes) -> Result[Face, FreeTypeError] {
+    return open_memory(self.shared, data)
+  }
+
+  /// Closes the library now instead of at the end of its owner's scope
+  /// (`FT_Done_FreeType` waits for its open faces).
+  pub fn close(take self) -> Unit {
+  }
+}

@@ -1,0 +1,112 @@
+// `freetype.error`: `FreeTypeError`, the failure every fallible call
+// returns: its kind from FreeType's `FT_Error`, the code, and FreeType's
+// message (`FT_Error_String`).
+
+use std.error.Error
+use pkg.sys.fterrors.FT_Error_String
+
+/// Why a FreeType call failed: the class of its `FT_Error`, or a failure
+/// of this package's own (`Unsupported`).
+#[derive(Eq, Hash)]
+pub type FreeTypeErrorKind =
+  /// `Cannot_Open_Resource`: the font file does not exist or cannot be
+  /// read.
+  | CannotOpen
+/// `Unknown_File_Format`: no FreeType driver recognizes the data as a
+/// font.
+  | UnknownFormat
+/// `Invalid_File_Format`, `Invalid_Table`, and the other errors of a
+/// recognized but broken font.
+  | InvalidFormat
+/// `Invalid_Glyph_Index`: the face has no glyph with that index.
+  | InvalidGlyph
+/// `Invalid_Pixel_Size`: a bitmap-only face has no strike of that size.
+  | InvalidPixelSize
+/// `Invalid_Argument`: a size, index, or other argument out of range.
+  | InvalidArgument
+/// `Out_Of_Memory`.
+  | OutOfMemory
+/// The glyph rendered to something other than an 8-bit grayscale bitmap
+/// (a monochrome or color bitmap strike).
+  | Unsupported
+/// Any other `FT_Error`; see `FreeTypeError.code`.
+  | Other
+
+/// A failed FreeType call: its kind, FreeType's `FT_Error` code (0 for
+/// `Unsupported`), and the message.
+#[derive(Eq)]
+pub struct FreeTypeError {
+  pub kind: FreeTypeErrorKind,
+  pub code: Int,
+  pub message: String,
+}
+
+impl Error for FreeTypeError {
+}
+
+impl Display for FreeTypeError {
+  /// `<kind>: <message>`, such as `CannotOpen: cannot open resource`.
+  fn to_string(self) -> String {
+    return "{self.kind}: {self.message}"
+  }
+}
+
+/// `Ok` for `FT_Err_Ok` (0), else the error `code` names.
+pub(pkg) fn check(code: i32) -> Result[Unit, FreeTypeError] {
+  if code == 0i32 {
+    return Ok(Unit)
+  }
+  // FreeType built without `FT_CONFIG_OPTION_ERROR_STRINGS` has no messages.
+  let message = FT_Error_String(code)
+  let text = if message.is_null() {
+    "FreeType error {code}"
+  } else {
+    String.from_c(message).unwrap_or("FreeType error {code}")
+  }
+  return Err(FreeTypeError { kind: kind_of(Int.from(code)), code: Int.from(code), message: text })
+}
+
+/// A failure of this package's own, with no FreeType code.
+pub(pkg) fn failure(kind: FreeTypeErrorKind, message: String) -> FreeTypeError {
+  return FreeTypeError { kind: kind, code: 0, message: message }
+}
+
+// Codes from `freetype/fterrdef.h`; a module's own error carries its base
+// in the high byte (`FT_ERR_BASE`), which the default build leaves 0.
+fn kind_of(code: Int) -> FreeTypeErrorKind {
+  return match code & 255 {
+    1 => CannotOpen
+    2 => UnknownFormat
+    3 | 4 | 5 | 8 | 9 | 20 | 21 => InvalidFormat
+    16 => InvalidGlyph
+    23 => InvalidPixelSize
+    6 | 10 => InvalidArgument
+    64 => OutOfMemory
+    _ => Other
+  }
+}
+
+#[test("FT_Error codes map to kinds")]
+fn codes_map_to_kinds() -> Unit {
+  expect.equal(kind_of(1), CannotOpen)
+  expect.equal(kind_of(2), UnknownFormat)
+  expect.equal(kind_of(3), InvalidFormat)
+  expect.equal(kind_of(16), InvalidGlyph)
+  expect.equal(kind_of(23), InvalidPixelSize)
+  expect.equal(kind_of(64), OutOfMemory)
+  expect.equal(kind_of(0x1601), CannotOpen)
+  expect.equal(kind_of(7), Other)
+}
+
+#[test("check passes 0 and reports FreeType's message otherwise")]
+fn check_reports_message() -> Unit {
+  expect.equal(check(0i32).is_ok(), true)
+  match check(1i32) {
+    Ok(_) => expect.equal("ok", "an error")
+    Err(error) => {
+      expect.equal(error.kind, CannotOpen)
+      expect.equal(error.code, 1)
+      expect.equal(error.message.is_empty(), false)
+    }
+  }
+}

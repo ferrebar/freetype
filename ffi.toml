@@ -1,0 +1,44 @@
+# `anvil ffi gen` writes `src/sys/` from the system FreeType 2 headers
+# (`pkg-config --cflags freetype2` is `-I/usr/include/freetype2` on Linux);
+# `anvil ffi gen --check` compares it in CI.
+#
+# `freetype/freetype.h` alone declares 150-odd functions, and each 2.x
+# release adds some, so the binding is pinned to the API the safe layer
+# uses: `ignore` drops every name and `require` brings back exactly those
+# below, all present since FreeType 2.10. A header that lacks one fails
+# `ffi gen` at that name; the output does not depend on the local FreeType
+# version (checked with the 2.15.0 headers; Ubuntu 24.04 ships 2.13.2).
+# The records the safe layer reads (`FT_FaceRec`, its glyph slot and
+# bitmap, the size metrics) generate as `#[c_struct]`s with their clang
+# layout, and the records they hold by value come with them. Load flags,
+# pixel modes, and error codes are `#define`s, which the generator does not
+# read; `src/face.fer` and `src/error.fer` spell the ones the package uses.
+# Using another function means adding it here.
+#
+# `FT_New_Memory_Face` is hand-written in `src/sys/hand.fer`: the face
+# reads `file_base` until `FT_Done_Face`, and the generated `CArray[u8]`
+# is a copy freed when the call returns.
+[generate]
+headers = ["freetype/freetype.h", "freetype/ftimage.h", "freetype/fterrors.h"]
+include = ["/usr/include/freetype2"]
+output = "src/sys"
+allow = "^FT_"
+ignore = "."
+require = [
+  # Types.
+  "FT_Library", "FT_Face", "FT_FaceRec_", "FT_GlyphSlotRec_", "FT_Bitmap_", "FT_Vector_",
+  "FT_SizeRec_", "FT_Size_Metrics_", "FT_Glyph_Metrics_",
+  # Library (`FT_Error_String` 2.10).
+  "FT_Init_FreeType", "FT_Done_FreeType", "FT_Error_String",
+  # Faces.
+  "FT_New_Face", "FT_Done_Face", "FT_Set_Pixel_Sizes",
+  # Glyphs.
+  "FT_Get_Char_Index", "FT_Load_Glyph", "FT_Get_Kerning",
+]
+
+# `FT_Library *alibrary` and `FT_Face *aface` are one value written by C.
+[arrays.FT_Init_FreeType]
+out = ["alibrary"]
+
+[arrays.FT_New_Face]
+out = ["aface"]

@@ -1,0 +1,270 @@
+// `freetype.face`: `Face`, one font face over an `FT_Face`, sized with
+// `set_pixel_size` and rendered glyph by glyph to 8-bit grayscale
+// bitmaps; `Glyph` and `FaceMetrics`. Faces come from a `Library`.
+
+use std.bytes.Bytes
+use std.ffi.{CBuffer, CLong, CULong, Out, Ptr}
+use std.ref.Ref
+use pkg.error.{FreeTypeError, InvalidArgument, InvalidGlyph, Unsupported, check, failure}
+use pkg.sys.freetype.{
+  FT_Done_Face,
+  FT_Done_FreeType,
+  FT_Face,
+  FT_Get_Char_Index,
+  FT_Get_Kerning,
+  FT_GlyphSlotRec_,
+  FT_Library,
+  FT_Load_Glyph,
+  FT_New_Face,
+  FT_Set_Pixel_Sizes,
+}
+use pkg.sys.ftimage.FT_Vector_
+use pkg.sys.hand.FT_New_Memory_Face
+
+/// `FT_LOAD_RENDER`: load the glyph and render it in `FT_RENDER_MODE_NORMAL`
+/// (8-bit anti-aliased coverage).
+const FT_LOAD_RENDER: i32 = 4
+/// `FT_PIXEL_MODE_GRAY`: one byte of coverage per pixel.
+const FT_PIXEL_MODE_GRAY: u8 = 2
+/// `FT_KERNING_DEFAULT`: grid-fitted kerning in 26.6 pixels.
+const FT_KERNING_DEFAULT: u32 = 0
+/// `FT_FACE_FLAG_KERNING`, what `FT_HAS_KERNING` tests.
+const FT_FACE_FLAG_KERNING: Int = 64
+
+/// A font face, a resource from `Library.open_face` or
+/// `Library.face_from_bytes`: closing it (the end of its owner's scope, or
+/// `close()`) runs `FT_Done_Face`. A face made from bytes holds its own
+/// copy of them until then, as `FT_New_Memory_Face` requires.
+///
+/// The face keeps its library open: `FT_Done_FreeType` runs when the
+/// library and every face made from it have closed, in whatever order
+/// their scopes end, so a face always closes before its library.
+///
+/// Size it with `set_pixel_size` before reading `metrics`, `glyph`, or
+/// `kerning`. A face is not `send` (see the README): it stays in the
+/// actor that made it.
+#[foreign_resource(close = done)]
+pub struct Face {
+  ptr: FT_Face,
+  // `face->glyph`, the face's one glyph slot, fixed for its life.
+  slot: Ptr[FT_GlyphSlotRec_],
+  // `face->num_glyphs`: `FT_Load_Glyph` calls an index past it
+  // `Invalid_Argument`.
+  glyphs: Int,
+  library: Ref[Shared],
+  // The font bytes of a memory face (empty for a file face).
+  data: CBuffer[u8],
+}
+
+/// One glyph rendered to an 8-bit grayscale coverage bitmap (0 is empty,
+/// 255 full), with its placement in whole pixels at the face's size.
+#[derive(Eq)]
+pub struct Glyph {
+  /// The glyph index rendered.
+  pub index: Int,
+  /// The bitmap's width in pixels.
+  pub width: Int,
+  /// The bitmap's height in pixels (rows).
+  pub rows: Int,
+  /// Bytes from one row to the next in `pixels` (at least `width`; FreeType
+  /// may pad rows). Negative when the rows run bottom-up, which the normal
+  /// renderer does not produce.
+  pub pitch: Int,
+  /// From the pen position to the bitmap's left edge (left bearing).
+  pub left: Int,
+  /// From the baseline up to the bitmap's top row (top bearing); y grows
+  /// up here, so the top row is drawn at `baseline - top`.
+  pub top: Int,
+  /// How far the pen moves right after this glyph.
+  pub advance: Int,
+  /// `rows * |pitch|` bytes of coverage, row by row; empty for a glyph
+  /// without ink, such as a space.
+  pub pixels: Bytes,
+}
+
+/// A face's vertical metrics in whole pixels at the size `set_pixel_size`
+/// chose (all 0 before it for a scalable face).
+#[derive(Eq)]
+pub struct FaceMetrics {
+  /// From the baseline up to the top of the highest glyphs.
+  pub ascender: Int,
+  /// From the baseline to the bottom of the lowest glyphs; negative (below
+  /// the baseline).
+  pub descender: Int,
+  /// From one baseline to the next.
+  pub line_height: Int,
+}
+
+// The library's handle and who still holds it: `FT_Done_FreeType` runs
+// once the `Library` and every `Face` made from it have closed.
+pub(pkg) struct Shared {
+  pub(pkg) ptr: FT_Library,
+  pub(pkg) faces: Int,
+  pub(pkg) closed: Bool,
+}
+
+/// Runs `FT_Done_FreeType` once nothing holds the library.
+pub(pkg) fn finish(shared: Ref[Shared]) -> Unit {
+  if shared.value.closed && shared.value.faces == 0 {
+    let _ = FT_Done_FreeType(shared.value.ptr)
+  }
+}
+
+fn done(face: Face) -> Unit {
+  let _ = FT_Done_Face(face.ptr)
+  face.library.value.faces -= 1
+  finish(face.library)
+}
+
+/// The first face in the font file at `path`.
+pub(pkg) fn open_file(library: Ref[Shared], path: String) -> Result[Face, FreeTypeError] {
+  let out = Out[FT_Face].new()
+  let code = FT_New_Face(library.value.ptr, path, 0, out)
+  return adopt(library, code, out.get(), CBuffer[u8].new(0))
+}
+
+/// The first face in the font file `bytes`, over a copy the face keeps.
+pub(pkg) fn open_memory(library: Ref[Shared], bytes: Bytes) -> Result[Face, FreeTypeError] {
+  // shortcut: two copies (Bytes to List to CBuffer), no Bytes-to-C view in std.ffi; fine at load time.
+  var data = CBuffer.from(bytes.to_list())
+  let out = Out[FT_Face].new()
+  let code = FT_New_Memory_Face(library.value.ptr, data.ptr(), data.len(), 0, out)
+  return adopt(library, code, out.get(), data)
+}
+
+// A failed `FT_New_*Face` leaves no face to close.
+fn adopt(library: Ref[Shared], code: i32, ptr: FT_Face, data: CBuffer[u8]) -> Result[Face, FreeTypeError] {
+  check(code)?
+  library.value.faces += 1
+  let record = ptr.read()
+  return Ok(
+    Face { ptr: ptr, slot: record.glyph, glyphs: int(record.num_glyphs), library: library, data: data }
+  )
+}
+
+impl Face {
+  /// Sets the size glyphs render at: `pixels` high per em
+  /// (`FT_Set_Pixel_Sizes(face, 0, pixels)`; the width follows). A bitmap
+  /// font without that size is an `InvalidPixelSize` error; below 1 is
+  /// `InvalidArgument`.
+  pub fn set_pixel_size(self, pixels: Int) -> Result[Unit, FreeTypeError] {
+    if pixels < 1 || pixels > 65535 {
+      return Err(failure(InvalidArgument, "pixel size {pixels} is not between 1 and 65535"))
+    }
+    return check(FT_Set_Pixel_Sizes(self.ptr, 0u32, pixels.try_to_u32().expect_ok("checked above")))
+  }
+
+  /// The glyph index of the Unicode `code_point` (`String.code_points()`
+  /// gives them) in the face's charmap; 0, the missing-glyph box, when the
+  /// face has none.
+  pub fn char_index(self, code_point: u32) -> Int {
+    return Int.from(FT_Get_Char_Index(self.ptr, CULong.from(code_point)))
+  }
+
+  /// Loads glyph `index` (from `char_index`) and renders it to an 8-bit
+  /// grayscale bitmap at the face's size (`FT_LOAD_RENDER`). An index past
+  /// the face's glyphs is an `InvalidGlyph` error; a glyph that renders to
+  /// something other than grayscale (a monochrome or color bitmap strike)
+  /// is `Unsupported`.
+  pub fn glyph(self, index: Int) -> Result[Glyph, FreeTypeError] {
+    if index >= self.glyphs {
+      return Err(failure(InvalidGlyph, "glyph index {index} is past the face's {self.glyphs} glyphs"))
+    }
+    check(FT_Load_Glyph(self.ptr, glyph_id(index)?, FT_LOAD_RENDER))?
+    let slot = self.slot.read()
+    let bitmap = slot.bitmap
+    let rows = Int.from(bitmap.rows)
+    let pitch = Int.from(bitmap.pitch)
+    if rows > 0 && bitmap.pixel_mode != FT_PIXEL_MODE_GRAY {
+      return Err(
+        failure(
+          Unsupported,
+          "glyph {index} rendered in FreeType pixel mode {bitmap.pixel_mode}, not 8-bit gray"
+        )
+      )
+    }
+    let size = rows * pitch.abs()
+    let pixels = if size == 0 || bitmap.buffer.is_null() {
+      Bytes.empty()
+    } else {
+      Bytes.from_c_len(bitmap.buffer, size.try_to_usize().expect_ok("a bitmap size is not negative"))
+    }
+    return Ok(
+      Glyph {
+        index: index,
+        width: Int.from(bitmap.width),
+        rows: rows,
+        pitch: pitch,
+        left: Int.from(slot.bitmap_left),
+        top: Int.from(slot.bitmap_top),
+        advance: whole(slot.advance.x),
+        pixels: pixels,
+      }
+    )
+  }
+
+  /// The horizontal kerning between glyphs `left` and `right` in whole
+  /// pixels at the face's size (usually negative, to bring them closer),
+  /// from the font's `kern` table (`FT_Get_Kerning`, `FT_KERNING_DEFAULT`);
+  /// 0 when the face has none for the pair (see `has_kerning`).
+  pub fn kerning(self, left: Int, right: Int) -> Result[Int, FreeTypeError] {
+    var vector = FT_Vector_.zeroed()
+    check(FT_Get_Kerning(self.ptr, glyph_id(left)?, glyph_id(right)?, FT_KERNING_DEFAULT, vector.ptr()))?
+    return Ok(whole(vector.x))
+  }
+
+  /// Whether the face has kerning data `kerning` reads (`FT_HAS_KERNING`).
+  pub fn has_kerning(self) -> Bool {
+    return int(self.ptr.read().face_flags) & FT_FACE_FLAG_KERNING != 0
+  }
+
+  /// The ascender, descender, and line height at the face's size.
+  pub fn metrics(self) -> FaceMetrics {
+    let metrics = self.ptr.read().size.read().metrics
+    return FaceMetrics {
+      ascender: whole(metrics.ascender),
+      descender: whole(metrics.descender),
+      line_height: whole(metrics.height),
+    }
+  }
+
+  /// The family name (`"Liberation Sans"`); empty when the font has none.
+  pub fn family_name(self) -> String {
+    return name(self.ptr.read().family_name)
+  }
+
+  /// The style name (`"Regular"`, `"Bold Italic"`); empty when the font
+  /// has none.
+  pub fn style_name(self) -> String {
+    return name(self.ptr.read().style_name)
+  }
+
+  /// Closes the face now instead of at the end of its owner's scope.
+  pub fn close(take self) -> Unit {
+  }
+}
+
+fn glyph_id(index: Int) -> Result[u32, FreeTypeError] {
+  return match index.try_to_u32() {
+    Ok(id) => Ok(id)
+    Err(_) => Err(failure(InvalidGlyph, "glyph index {index} is out of range"))
+  }
+}
+
+// 26.6 fixed point to whole pixels, rounded.
+fn whole(value: CLong) -> Int {
+  return (int(value) + 32) >> 6
+}
+
+fn name(text: Ptr[u8]) -> String {
+  if text.is_null() {
+    return ""
+  }
+  return String.from_c(text).unwrap_or("")
+}
+
+// C's `long` as an `Int`. shortcut: `CLong` is `Int` on LP64 (Linux, macOS),
+// where any conversion is F1335; a 32-bit `long` (Windows) needs `Int.from`.
+fn int(value: CLong) -> Int {
+  return value
+}
